@@ -9,8 +9,8 @@ import pandas as pd
 from .config import (
     DATA_DIR,
     COLUMNS,
-    month_excel_path,
 )
+from .db import fetch_tool_entries, list_entry_months, upsert_tool_entry
 
 # -----------------------------
 # JSON helpers (safe writes)
@@ -23,10 +23,9 @@ def load_json(path: str, default: Any):
         return default
         
 def parts_for_line(selected_line: str):
-    from .config import PARTS_FILE
-    store = load_json(PARTS_FILE, {"parts": []}) or {"parts": []}
+    from .db import list_parts_with_lines
     out = []
-    for p in store.get("parts", []):
+    for p in list_parts_with_lines():
         lines = p.get("lines", []) or []
         if not selected_line or selected_line in lines:
             out.append(p.get("part_number", ""))
@@ -40,99 +39,131 @@ def save_json(path: str, obj: Any) -> None:
     os.replace(tmp, path)
 
 
-# -----------------------------
-# Excel schema helpers
-# -----------------------------
+ENTRY_COLUMNS = [
+    "ID",
+    "Date",
+    "Time",
+    "Shift",
+    "Line",
+    "Machine",
+    "Part_Number",
+    "Tool_Num",
+    "Reason",
+    "Downtime_Mins",
+    "Cost",
+    "Tool_Life",
+    "Tool_Changer",
+    "Defects_Present",
+    "Defect_Qty",
+    "Sort_Done",
+    "Defect_Reason",
+    "Quality_Verified",
+    "Quality_User",
+    "Quality_Time",
+    "Leader_Sign",
+    "Leader_User",
+    "Leader_Time",
+    "Serial_Numbers",
+    "Andon_Flag",
+    "Customer_Risk",
+    "QC_Status",
+    "NCR_ID",
+    "NCR_Status",
+    "NCR_Close_Date",
+    "Action_Status",
+    "Action_Due_Date",
+    "Gage_Used",
+    "COPQ_Est",
+]
+
+
 def ensure_df_schema(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Ensures df has all required columns and returns df ordered by COLUMNS.
+    Ensures df has all required columns and returns df ordered by ENTRY_COLUMNS.
     Missing columns are added as blank.
     Extra columns are preserved at the end.
     """
-    for col in COLUMNS:
+    for col in ENTRY_COLUMNS:
         if col not in df.columns:
             df[col] = ""
 
-    # Keep extras but put known columns first
-    extras = [c for c in df.columns if c not in COLUMNS]
-    df = df[COLUMNS + extras]
+    extras = [c for c in df.columns if c not in ENTRY_COLUMNS]
+    df = df[ENTRY_COLUMNS + extras]
     return df
 
-def ensure_excel_file(path: str) -> None:
-    """
-    Ensures the Excel file exists and includes all columns.
-    If file doesn't exist -> create empty.
-    If exists -> load + add missing columns + rewrite.
-    """
-    os.makedirs(os.path.dirname(path), exist_ok=True)
 
-    if not os.path.exists(path):
-        pd.DataFrame(columns=COLUMNS).to_excel(path, index=False)
-        return
-
-    try:
-        df = pd.read_excel(path)
-        df = ensure_df_schema(df)
-        df.to_excel(path, index=False)
-    except Exception:
-        # Don't overwrite a possibly corrupted file.
-        # Create a rescue new file so app can continue.
-        base, ext = os.path.splitext(path)
-        rescue = f"{base}_RESCUE_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}"
-        pd.DataFrame(columns=COLUMNS).to_excel(rescue, index=False)
-
-
-# -----------------------------
-# Month file utilities
-# -----------------------------
 def list_month_files() -> list[str]:
-    """
-    Returns list of tool_life_data_YYYY_MM.xlsx files found in /data
-    """
-    if not os.path.exists(DATA_DIR):
-        return []
-    files = []
-    for fn in os.listdir(DATA_DIR):
-        if fn.lower().startswith("tool_life_data_") and fn.lower().endswith(".xlsx"):
-            files.append(fn)
-    files.sort(reverse=True)  # newest first by name
-    return files
-
-def resolve_month_path(filename: Optional[str] = None) -> str:
-    """
-    If filename provided (e.g., 'tool_life_data_2026_01.xlsx'), return absolute path in data dir.
-    Otherwise return current month path.
-    """
-    if filename:
-        return os.path.join(DATA_DIR, filename)
-    return month_excel_path(datetime.now())
+    months = list_entry_months()
+    if not months:
+        months = [datetime.now().strftime("%Y-%m")]
+    return months
 
 
-# -----------------------------
-# Main data access
-# -----------------------------
+def _normalize_month(value: Optional[str]) -> str:
+    if value:
+        return str(value)
+    return datetime.now().strftime("%Y-%m")
+
+
 def get_df(filename: Optional[str] = None) -> Tuple[pd.DataFrame, str]:
     """
-    Load a month Excel file into DataFrame.
-    Returns (df, filename_used).
+    Load a month of entries from SQLite into DataFrame.
+    Returns (df, month_key).
     """
-    path = resolve_month_path(filename)
-    ensure_excel_file(path)
-
-    # Read again (ensure_excel_file may have created/updated it)
-    df = pd.read_excel(path)
+    month = _normalize_month(filename)
+    rows = fetch_tool_entries(month)
+    if rows:
+        df = pd.DataFrame(rows)
+        df = df.rename(columns={
+            "id": "ID",
+            "date": "Date",
+            "time": "Time",
+            "shift": "Shift",
+            "line": "Line",
+            "machine": "Machine",
+            "part_number": "Part_Number",
+            "tool_num": "Tool_Num",
+            "reason": "Reason",
+            "downtime_mins": "Downtime_Mins",
+            "cost": "Cost",
+            "tool_life": "Tool_Life",
+            "tool_changer": "Tool_Changer",
+            "defects_present": "Defects_Present",
+            "defect_qty": "Defect_Qty",
+            "sort_done": "Sort_Done",
+            "defect_reason": "Defect_Reason",
+            "quality_verified": "Quality_Verified",
+            "quality_user": "Quality_User",
+            "quality_time": "Quality_Time",
+            "leader_sign": "Leader_Sign",
+            "leader_user": "Leader_User",
+            "leader_time": "Leader_Time",
+            "serial_numbers": "Serial_Numbers",
+            "andon_flag": "Andon_Flag",
+            "customer_risk": "Customer_Risk",
+            "qc_status": "QC_Status",
+            "ncr_id": "NCR_ID",
+            "ncr_status": "NCR_Status",
+            "ncr_close_date": "NCR_Close_Date",
+            "action_status": "Action_Status",
+            "action_due_date": "Action_Due_Date",
+            "gage_used": "Gage_Used",
+            "copq_est": "COPQ_Est",
+        })
+    else:
+        df = pd.DataFrame(columns=ENTRY_COLUMNS)
     df = ensure_df_schema(df)
-    return df, os.path.basename(path)
+    return df, month
+
 
 def save_df(df: pd.DataFrame, filename: str) -> None:
     """
-    Save DataFrame back to month Excel file with correct schema/column order.
-    filename should be a basename like 'tool_life_data_2026_01.xlsx'
+    Save DataFrame rows back to SQLite.
+    filename is treated as month key (YYYY-MM).
     """
-    path = resolve_month_path(filename)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
     df = ensure_df_schema(df)
-    df.to_excel(path, index=False)
+    for _, row in df.iterrows():
+        upsert_tool_entry(row.to_dict())
 
 
 # -----------------------------
@@ -164,12 +195,12 @@ def safe_float(val: Any, default: float = 0.0) -> float:
 # -----------------------------
 # ID helper
 # -----------------------------
-def next_id(df: pd.DataFrame) -> str:
+def next_id(df: Optional[pd.DataFrame] = None) -> str:
     """
     Generates a reasonably unique ID for a new row.
     Format: YYYYMMDD-HHMMSS-XXXX
     """
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    # Use row count + time as pseudo-random 4 digits
-    suffix = str(len(df) % 10000).zfill(4)
+    count = len(df) if df is not None else 0
+    suffix = str(count % 10000).zfill(4)
     return f"{ts}-{suffix}"

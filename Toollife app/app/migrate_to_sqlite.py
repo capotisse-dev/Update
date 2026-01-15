@@ -3,8 +3,19 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from .db import init_db, seed_default_users, upsert_part, upsert_tool, set_scrap_cost, ensure_lines
+from .db import (
+    init_db,
+    seed_default_users,
+    upsert_part,
+    upsert_tool_inventory,
+    set_scrap_cost,
+    ensure_lines,
+    upsert_tool_entry,
+)
 from .storage import load_json
+from .config import DATA_DIR
+import os
+import pandas as pd
 from .config import (
     DEFAULT_USERS,
     USERS_FILE,
@@ -74,14 +85,27 @@ def run_migration() -> None:
             if not tool_num:
                 continue
             info = info if isinstance(info, dict) else {}
-            upsert_tool(tool_num=str(tool_num), name=str(info.get("name", "") or ""), unit_cost=float(info.get("unit_cost", 0.0) or 0.0))
+            upsert_tool_inventory(
+                tool_num=str(tool_num),
+                name=str(info.get("name", "") or ""),
+                unit_cost=float(info.get("unit_cost", 0.0) or 0.0),
+                stock_qty=int(info.get("stock", 0) or 0),
+                inserts_per_tool=int(info.get("inserts", 1) or 1),
+            )
     else:
         # legacy: tool_store might already be a {tool_num: {...}}
         for tool_num, info in tool_store.items():
             if tool_num == "tools":
                 continue
             info = info if isinstance(info, dict) else {}
-            upsert_tool(tool_num=str(tool_num), name=str(info.get("name", "") or ""), unit_cost=float(info.get("unit_cost", 0.0) or 0.0))
+            tool_id = str(tool_num).replace("Tool ", "").strip()
+            upsert_tool_inventory(
+                tool_num=tool_id or str(tool_num),
+                name=str(info.get("name", "") or ""),
+                unit_cost=float(info.get("cost", info.get("unit_cost", 0.0)) or 0.0),
+                stock_qty=int(info.get("stock", 0) or 0),
+                inserts_per_tool=int(info.get("inserts", 1) or 1),
+            )
 
     # Scrap costs
     raw_cost = load_json(COST_CONFIG_FILE, {}) or {}
@@ -93,6 +117,21 @@ def run_migration() -> None:
                     set_scrap_cost(str(pn), float(cost))
                 except Exception:
                     continue
+
+    # Tool entry history from Excel -> SQLite (if any)
+    for fn in os.listdir(DATA_DIR):
+        if not fn.lower().startswith("tool_life_data_") or not fn.lower().endswith(".xlsx"):
+            continue
+        path = os.path.join(DATA_DIR, fn)
+        try:
+            df = pd.read_excel(path)
+        except Exception:
+            continue
+        for _, row in df.iterrows():
+            try:
+                upsert_tool_entry(row.to_dict())
+            except Exception:
+                continue
 
     print("✅ Migration complete.")
 

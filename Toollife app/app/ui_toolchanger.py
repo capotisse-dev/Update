@@ -1,11 +1,15 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import datetime
-import pandas as pd
 
 from .ui_common import HeaderFrame
-from .storage import get_df, save_df, next_id, safe_int, safe_float, load_json
-from .config import REASONS_FILE, PARTS_FILE, TOOL_CONFIG_FILE
+from .ui_action_center import ActionCenterUI
+from .ui_audit import AuditTrailUI
+from .screen_registry import get_screen_class
+from .storage import next_id, safe_int, safe_float, load_json, parts_for_line
+from .config import REASONS_FILE
+from .db import get_tool, update_tool_stock, upsert_tool_entry
+from .audit import log_audit
 
 class ToolChangerUI(tk.Frame):
     def __init__(self, parent, controller, show_header=True):
@@ -15,7 +19,35 @@ class ToolChangerUI(tk.Frame):
         if show_header:
             HeaderFrame(self, controller).pack(fill="x")
 
-        body = tk.Frame(self, bg=controller.colors["bg"], padx=20, pady=20)
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, padx=10, pady=10)
+
+        tab_main = tk.Frame(nb, bg=controller.colors["bg"])
+        tab_actions = tk.Frame(nb, bg=controller.colors["bg"])
+        tab_audit = tk.Frame(nb, bg=controller.colors["bg"])
+        nb.add(tab_main, text="Tool Changer")
+        nb.add(tab_actions, text="Action Center")
+        nb.add(tab_audit, text="Audit Trail")
+
+        try:
+            ActionCenterUI(tab_actions, controller, show_header=False).pack(fill="both", expand=True)
+        except TypeError:
+            ActionCenterUI(tab_actions, controller).pack(fill="both", expand=True)
+        try:
+            AuditTrailUI(tab_audit, controller, show_header=False).pack(fill="both", expand=True)
+        except TypeError:
+            AuditTrailUI(tab_audit, controller).pack(fill="both", expand=True)
+
+        for screen in controller.extra_screens():
+            tab_extra = tk.Frame(nb, bg=controller.colors["bg"])
+            nb.add(tab_extra, text=screen)
+            ViewCls = get_screen_class(screen)
+            try:
+                ViewCls(tab_extra, controller, show_header=False).pack(fill="both", expand=True)
+            except TypeError:
+                ViewCls(tab_extra, controller).pack(fill="both", expand=True)
+
+        body = tk.Frame(tab_main, bg=controller.colors["bg"], padx=20, pady=20)
         body.pack(fill="both", expand=True)
 
         style = {"bg": controller.colors["bg"], "fg": controller.colors["fg"]}
@@ -43,8 +75,7 @@ class ToolChangerUI(tk.Frame):
 
         # Part
         tk.Label(body, text="Part #:", **style).grid(row=4, column=0, sticky="e", pady=5)
-        parts = load_json(PARTS_FILE, [])
-        self.part_cb = ttk.Combobox(body, values=parts, width=20)  # allow typing
+        self.part_cb = ttk.Combobox(body, values=[], width=20)  # allow typing
         self.part_cb.grid(row=4, column=1, sticky="w")
 
         # Tool
@@ -62,18 +93,24 @@ class ToolChangerUI(tk.Frame):
         self.reason_cb = ttk.Combobox(body, values=reasons, state="readonly", width=28)
         self.reason_cb.grid(row=6, column=1, sticky="w")
 
+        # Tool life
+        tk.Label(body, text="Tool Life:", **style).grid(row=7, column=0, sticky="e", pady=5)
+        self.life_entry = tk.Entry(body, width=10)
+        self.life_entry.insert(0, "0")
+        self.life_entry.grid(row=7, column=1, sticky="w")
+
         # Downtime
-        tk.Label(body, text="Downtime (min):", **style).grid(row=7, column=0, sticky="e", pady=5)
+        tk.Label(body, text="Downtime (min):", **style).grid(row=8, column=0, sticky="e", pady=5)
         self.down_entry = tk.Entry(body, width=10)
         self.down_entry.insert(0, "0")
-        self.down_entry.grid(row=7, column=1, sticky="w")
+        self.down_entry.grid(row=8, column=1, sticky="w")
 
         # Defects?
         self.defect_var = tk.BooleanVar(value=False)
         tk.Checkbutton(
             body, text="Were defects produced?", variable=self.defect_var, command=self.toggle_defect,
             bg=controller.colors["bg"], fg=controller.colors["fg"], font=("Arial", 12)
-        ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         self.defect_frame = tk.Frame(body, borderwidth=1, relief="solid", padx=10, pady=10, bg=controller.colors["bg"])
         tk.Label(self.defect_frame, text="Defect Qty:", **style).pack(anchor="w")
@@ -93,7 +130,7 @@ class ToolChangerUI(tk.Frame):
         tk.Button(
             body, text="SUBMIT ENTRY", command=self.submit,
             bg="#28a745", fg="white", font=("Arial", 14, "bold"), height=2
-        ).grid(row=10, column=0, columnspan=3, pady=20, sticky="we")
+        ).grid(row=11, column=0, columnspan=3, pady=20, sticky="we")
 
         self.update_machines()
 
@@ -107,6 +144,11 @@ class ToolChangerUI(tk.Frame):
         self.mach_cb.set("")
         self.tool_cb.set("")
         self.stock_lbl.config(text="Stock: N/A")
+        self.update_parts()
+
+    def update_parts(self):
+        parts = parts_for_line(self.line_cb.get())
+        self.part_cb["values"] = parts
 
     def update_tools(self, event=None):
         line = self.line_cb.get()
@@ -136,16 +178,18 @@ class ToolChangerUI(tk.Frame):
 
     def update_stock_display(self, event=None):
         tool = self.tool_cb.get()
-        cfg = load_json(TOOL_CONFIG_FILE, {})
-        key = f"Tool {tool}"
-        if key in cfg:
-            self.stock_lbl.config(text=f"Stock: {cfg[key].get('stock', 'N/A')}")
+        if not tool:
+            self.stock_lbl.config(text="Stock: N/A")
+            return
+        info = get_tool(tool)
+        if info:
+            self.stock_lbl.config(text=f"Stock: {info.get('stock_qty', 'N/A')}")
         else:
             self.stock_lbl.config(text="Stock: N/A")
 
     def toggle_defect(self):
         if self.defect_var.get():
-            self.defect_frame.grid(row=9, column=0, columnspan=2, sticky="we", pady=10)
+            self.defect_frame.grid(row=10, column=0, columnspan=2, sticky="we", pady=10)
         else:
             self.defect_frame.grid_remove()
 
@@ -153,26 +197,27 @@ class ToolChangerUI(tk.Frame):
         if not self.mach_cb.get() or not self.tool_cb.get() or not self.reason_cb.get():
             messagebox.showwarning("Missing Info", "Select Machine, Tool, and Reason")
             return
+        if not self.life_entry.get().strip():
+            messagebox.showwarning("Missing Info", "Enter tool life for this change.")
+            return
 
         downtime = safe_int(self.down_entry.get(), 0)
+        tool_life = safe_float(self.life_entry.get(), 0.0)
 
-        cfg = load_json(TOOL_CONFIG_FILE, {})
-        tool_key = f"Tool {self.tool_cb.get()}"
+        tool_num = self.tool_cb.get()
         cost = 0.0
 
         # Inventory decrement (if configured)
-        if tool_key in cfg:
-            cost = safe_float(cfg[tool_key].get("cost", 0), 0.0)
-            stock = safe_int(cfg[tool_key].get("stock", 0), 0)
+        info = get_tool(tool_num)
+        if info:
+            cost = safe_float(info.get("unit_cost", 0), 0.0)
+            stock = safe_int(info.get("stock_qty", 0), 0)
             if stock <= 0:
-                if not messagebox.askyesno("Stock Warning", f"{tool_key} is out of stock! Submit anyway?"):
+                if not messagebox.askyesno("Stock Warning", f"Tool {tool_num} is out of stock! Submit anyway?"):
                     return
             else:
-                cfg[tool_key]["stock"] = stock - 1
-                from .storage import save_json
-                save_json(TOOL_CONFIG_FILE, cfg)
+                update_tool_stock(tool_num, stock - 1)
 
-        df, filename = get_df()  # current month
         now = datetime.now()
 
         defects = "Yes" if self.defect_var.get() else "No"
@@ -181,7 +226,7 @@ class ToolChangerUI(tk.Frame):
         defect_reason = self.defect_reason.get().strip() if self.defect_var.get() else ""
 
         new_row = {
-            "ID": next_id(df),
+            "ID": next_id(),
             "Date": now.strftime("%Y-%m-%d"),
             "Time": now.strftime("%H:%M:%S"),
             "Shift": self.shift_cb.get(),
@@ -192,6 +237,7 @@ class ToolChangerUI(tk.Frame):
             "Reason": self.reason_cb.get(),
             "Downtime_Mins": downtime,
             "Cost": float(cost),
+            "Tool_Life": float(tool_life),
             "Tool_Changer": self.controller.user,
             "Defects_Present": defects,
             "Defect_Qty": defect_qty,
@@ -206,8 +252,8 @@ class ToolChangerUI(tk.Frame):
             "Serial_Numbers": ""
         }
 
-        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-        save_df(df, filename)
+        upsert_tool_entry(new_row)
+        log_audit(self.controller.user, f"Tool change entry {new_row['ID']} saved")
 
         messagebox.showinfo("Saved", f"Entry saved.\nTool cost: ${cost:,.2f}")
 
@@ -217,4 +263,5 @@ class ToolChangerUI(tk.Frame):
         self.qty_entry.delete(0, "end"); self.qty_entry.insert(0, "0")
         self.sort_var.set(False)
         self.defect_reason.delete(0, "end")
+        self.life_entry.delete(0, "end"); self.life_entry.insert(0, "0")
         self.update_stock_display()

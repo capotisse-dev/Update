@@ -117,6 +117,11 @@ class SuperUI(tk.Frame):
             "Action Center screen missing",
             "Expected: app/ui_action_center.py → class ActionCenterUI",
         )
+        AuditTrailUI = _safe_view(
+            lambda: __import__("app.ui_audit", fromlist=["AuditTrailUI"]).AuditTrailUI,
+            "Audit Trail screen missing",
+            "Expected: app/ui_audit.py → class AuditTrailUI",
+        )
         DashboardUI = _safe_view(
             lambda: __import__("app.ui_dashboard", fromlist=["DashboardUI"]).DashboardUI,
             "Dashboard screen missing",
@@ -153,6 +158,7 @@ class SuperUI(tk.Frame):
             ("Dashboard", DashboardUI),
             ("Notifications", NotificationsUI),
             ("Action Center", ActionCenterUI),
+            ("Audit Trail", AuditTrailUI),
 
             ("Tool Changer", ToolChangerUI),
             ("Leader", LeaderUI),

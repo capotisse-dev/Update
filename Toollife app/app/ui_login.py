@@ -3,10 +3,11 @@ import tkinter as tk
 from tkinter import messagebox
 
 from .bootstrap import ensure_app_initialized
-from .config import USERS_FILE
-from .storage import load_json
+from .db import get_user, update_user_fields
 from .audit import log_audit
 from .ui_common import LIGHT, DARK
+from .permissions import screen_access as permission_screen_access, can_edit_screen as permission_can_edit_screen, ROLE_SCREEN_DEFAULTS
+from .screen_registry import SCREEN_REGISTRY
 
 # Role UIs
 from .ui_toolchanger import ToolChangerUI
@@ -137,6 +138,22 @@ class App(tk.Tk):
         except TypeError:
             ui_cls(self.container, self).pack(fill="both", expand=True)
 
+    def screen_access(self, screen: str) -> str:
+        return permission_screen_access(self.role, self.user, screen)
+
+    def can_edit_screen(self, screen: str) -> bool:
+        return permission_can_edit_screen(self.role, self.user, screen)
+
+    def extra_screens(self):
+        defaults = ROLE_SCREEN_DEFAULTS.get(self.role, {})
+        extras = []
+        for screen in SCREEN_REGISTRY.keys():
+            if screen in defaults:
+                continue
+            if self.screen_access(screen) != "none":
+                extras.append(screen)
+        return extras
+
     def logout(self):
         if self.user:
             log_audit(self.user, "Logout")
@@ -179,14 +196,26 @@ class LoginPage(tk.Frame):
         self.p = tk.Entry(card, width=30, show="*", font=("Arial", 12))
         self.p.pack(pady=5)
 
+        btns = tk.Frame(card, bg=controller.colors["header_bg"])
+        btns.pack(pady=20)
+
         tk.Button(
-            card,
+            btns,
             text="Login",
             bg="#007bff", fg="white",
             font=("Arial", 12, "bold"),
-            width=20,
+            width=16,
             command=self.check
-        ).pack(pady=20)
+        ).pack(side="left", padx=6)
+
+        tk.Button(
+            btns,
+            text="Show/Reset Password",
+            bg="#6c757d", fg="white",
+            font=("Arial", 10, "bold"),
+            width=18,
+            command=self.show_or_reset_password
+        ).pack(side="left", padx=6)
 
         tk.Label(
             card,
@@ -201,7 +230,6 @@ class LoginPage(tk.Frame):
         self.p.bind("<Return>", lambda e: self.check())
 
     def check(self):
-        users = load_json(USERS_FILE, {})
         u = self.u.get().strip()
         p = self.p.get()
 
@@ -209,11 +237,11 @@ class LoginPage(tk.Frame):
             messagebox.showerror("Error", "Enter username.")
             return
 
-        if u not in users:
+        rec = get_user(u)
+        if not rec:
             messagebox.showerror("Error", "Invalid credentials.")
             return
 
-        rec = users[u]
         if rec.get("password", "") != p:
             messagebox.showerror("Error", "Invalid credentials.")
             return
@@ -231,3 +259,22 @@ class LoginPage(tk.Frame):
             return
 
         self.controller.login(u, role, line)
+        messagebox.showinfo("Welcome", f"welcome '{rec.get('name', u)}'")
+
+    def show_or_reset_password(self):
+        u = self.u.get().strip()
+        if not u:
+            messagebox.showerror("Error", "Enter username first.")
+            return
+        rec = get_user(u)
+        if not rec:
+            messagebox.showerror("Error", "User not found.")
+            return
+        current = rec.get("password", "")
+        if messagebox.askyesno("Current Password", f"Current password for {u} is: {current}\n\nReset it?"):
+            new_pw = self.p.get().strip()
+            if not new_pw:
+                messagebox.showerror("Error", "Enter new password in the Password field.")
+                return
+            update_user_fields(u, {"password": new_pw})
+            messagebox.showinfo("Reset", f"Password updated for {u}.")
