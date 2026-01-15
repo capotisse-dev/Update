@@ -197,17 +197,17 @@ class ActionCenterUI(tk.Frame):
             messagebox.showerror("Not allowed", "You can only update items assigned to you.")
             return
 
-        set_action_status(aid, status, closed_by=self.username)
+        set_action_status(aid, status, closed_by=self.username, actor=self.username)
 
         # If it's an NCR-linked action, mirror status into ncrs.json
         rel = a.get("related") or {}
         if isinstance(rel, dict) and rel.get("ncr_id"):
             # Basic mapping
             if status == "Closed":
-                set_ncr_status(rel["ncr_id"], "Closed")
+                set_ncr_status(rel["ncr_id"], "Closed", actor=self.username)
             elif status in ("Open", "In Progress", "Blocked"):
                 # keep NCR open unless closed
-                set_ncr_status(rel["ncr_id"], "Open")
+                set_ncr_status(rel["ncr_id"], "Open", actor=self.username)
 
         self.refresh()
 
@@ -301,7 +301,7 @@ class ActionCenterUI(tk.Frame):
                 "related": (existing or {}).get("related", {}),
             }
 
-            upsert_action(payload)
+            upsert_action(payload, actor=self.username)
             win.destroy()
             self.refresh()
 

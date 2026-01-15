@@ -1,13 +1,19 @@
 # app/action_store.py
 from __future__ import annotations
 
-import os
-import json
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from .config import ACTIONS_FILE, NCRS_FILE, USERS_FILE
-from .storage import load_json, save_json
+from .db import (
+    list_users,
+    list_actions,
+    list_ncrs,
+    upsert_action as db_upsert_action,
+    upsert_ncr as db_upsert_ncr,
+    set_action_status as db_set_action_status,
+    set_ncr_status as db_set_ncr_status,
+    log_audit,
+)
 
 
 def now_iso() -> str:
@@ -18,55 +24,37 @@ def new_id(prefix: str) -> str:
     return f"{prefix}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
 
-def get_users_map() -> Dict[str, Dict[str, Any]]:
-    return load_json(USERS_FILE, {}) or {}
-
-
 def list_usernames() -> List[str]:
-    users = get_users_map()
-    names = sorted([u for u in users.keys()])
-    return names
-
-
-def _ensure_actions_shape(store: Any) -> Dict[str, Any]:
-    if not isinstance(store, dict):
-        store = {}
-    store.setdefault("version", 1)
-    store.setdefault("actions", [])
-    if not isinstance(store["actions"], list):
-        store["actions"] = []
-    return store
-
-
-def _ensure_ncrs_shape(store: Any) -> Dict[str, Any]:
-    if not isinstance(store, dict):
-        store = {}
-    store.setdefault("version", 1)
-    store.setdefault("ncrs", [])
-    if not isinstance(store["ncrs"], list):
-        store["ncrs"] = []
-    return store
+    return sorted([u["username"] for u in list_users()])
 
 
 def load_actions_store() -> Dict[str, Any]:
-    return _ensure_actions_shape(load_json(ACTIONS_FILE, {"version": 1, "actions": []}))
+    actions = []
+    for a in list_actions():
+        rel = {}
+        if a.get("related_ncr_id"):
+            rel["ncr_id"] = a.get("related_ncr_id")
+        if a.get("related_entry_id"):
+            rel["entry_id"] = a.get("related_entry_id")
+        a = dict(a)
+        a["related"] = rel
+        actions.append(a)
+    return {"version": 1, "actions": actions}
 
 
 def save_actions_store(store: Dict[str, Any]) -> None:
-    store = _ensure_actions_shape(store)
-    save_json(ACTIONS_FILE, store)
+    return None
 
 
 def load_ncrs_store() -> Dict[str, Any]:
-    return _ensure_ncrs_shape(load_json(NCRS_FILE, {"version": 1, "ncrs": []}))
+    return {"version": 1, "ncrs": list_ncrs()}
 
 
 def save_ncrs_store(store: Dict[str, Any]) -> None:
-    store = _ensure_ncrs_shape(store)
-    save_json(NCRS_FILE, store)
+    return None
 
 
-def upsert_action(action: Dict[str, Any]) -> Dict[str, Any]:
+def upsert_action(action: Dict[str, Any], actor: str = "") -> Dict[str, Any]:
     """
     Action schema (minimal):
     {
@@ -79,9 +67,6 @@ def upsert_action(action: Dict[str, Any]) -> Dict[str, Any]:
       "notes"
     }
     """
-    store = load_actions_store()
-    actions = store["actions"]
-
     if not action.get("action_id"):
         action["action_id"] = new_id("A")
     action.setdefault("type", "Action")
@@ -91,37 +76,19 @@ def upsert_action(action: Dict[str, Any]) -> Dict[str, Any]:
     action.setdefault("notes", "")
     action.setdefault("related", {})
 
-    found = False
-    for i, a in enumerate(actions):
-        if a.get("action_id") == action["action_id"]:
-            actions[i] = {**a, **action, "updated_at": now_iso()}
-            found = True
-            break
-
-    if not found:
-        action["updated_at"] = now_iso()
-        actions.append(action)
-
-    store["actions"] = actions
-    save_actions_store(store)
-    return action
+    saved = db_upsert_action(action)
+    if actor:
+        log_audit(actor, f"Updated action {saved.get('action_id')}: {saved.get('status')}")
+    return saved
 
 
-def set_action_status(action_id: str, status: str, closed_by: Optional[str] = None) -> None:
-    store = load_actions_store()
-    for a in store["actions"]:
-        if a.get("action_id") == action_id:
-            a["status"] = status
-            a["updated_at"] = now_iso()
-            if status == "Closed":
-                a["closed_at"] = now_iso()
-                if closed_by:
-                    a["closed_by"] = closed_by
-            break
-    save_actions_store(store)
+def set_action_status(action_id: str, status: str, closed_by: Optional[str] = None, actor: str = "") -> None:
+    db_set_action_status(action_id, status, closed_by or "")
+    if actor:
+        log_audit(actor, f"Set action {action_id} status to {status}")
 
 
-def upsert_ncr(ncr: Dict[str, Any]) -> Dict[str, Any]:
+def upsert_ncr(ncr: Dict[str, Any], actor: str = "") -> Dict[str, Any]:
     """
     NCR schema (minimal):
     {
@@ -131,39 +98,21 @@ def upsert_ncr(ncr: Dict[str, Any]) -> Dict[str, Any]:
       "close_date", "related_entry_id"
     }
     """
-    store = load_ncrs_store()
-    ncrs = store["ncrs"]
-
     if not ncr.get("ncr_id"):
         ncr["ncr_id"] = new_id("NCR")
     ncr.setdefault("status", "Open")
     ncr.setdefault("created_at", now_iso())
 
-    found = False
-    for i, x in enumerate(ncrs):
-        if x.get("ncr_id") == ncr["ncr_id"]:
-            ncrs[i] = {**x, **ncr, "updated_at": now_iso()}
-            found = True
-            break
-    if not found:
-        ncr["updated_at"] = now_iso()
-        ncrs.append(ncr)
-
-    store["ncrs"] = ncrs
-    save_ncrs_store(store)
-    return ncr
+    saved = db_upsert_ncr(ncr)
+    if actor:
+        log_audit(actor, f"Updated NCR {saved.get('ncr_id')} status {saved.get('status')}")
+    return saved
 
 
-def set_ncr_status(ncr_id: str, status: str) -> None:
-    store = load_ncrs_store()
-    for n in store["ncrs"]:
-        if n.get("ncr_id") == ncr_id:
-            n["status"] = status
-            n["updated_at"] = now_iso()
-            if status == "Closed":
-                n["close_date"] = datetime.now().strftime("%Y-%m-%d")
-            break
-    save_ncrs_store(store)
+def set_ncr_status(ncr_id: str, status: str, actor: str = "") -> None:
+    db_set_ncr_status(ncr_id, status)
+    if actor:
+        log_audit(actor, f"Set NCR {ncr_id} status to {status}")
 
 
 def create_ncr_and_action(
@@ -189,7 +138,7 @@ def create_ncr_and_action(
         "description": description,
         "created_by": created_by,
         "related_entry_id": related_entry_id,
-    })
+    }, actor=created_by)
 
     action = upsert_action({
         "type": "NCR",
@@ -203,9 +152,9 @@ def create_ncr_and_action(
         "part_number": part_number,
         "related": {"ncr_id": ncr["ncr_id"], "entry_id": related_entry_id},
         "notes": description
-    })
+    }, actor=created_by)
 
     # back-link (optional)
-    ncr = upsert_ncr({**ncr, "action_id": action["action_id"]})
+    ncr = upsert_ncr({**ncr, "action_id": action["action_id"]}, actor=created_by)
 
     return {"ncr": ncr, "action": action}
